@@ -1,0 +1,1971 @@
+---
+title: "SIMBA"
+author: "LC"
+date: "26/7/2021"
+output: html_document
+---
+```{r}
+
+memory.limit(size=140000) # memory mi vede 14 GB
+library(dada2); packageVersion("dada2")
+
+#setwd and path containing fastq files
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA_July 2021/Analisi Lady/trimmed")
+
+path <- "C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA_July 2021/Analisi Lady/trimmed" 
+
+list.files(path)
+
+# Forward and reverse fastq filenames have format: SAMPLENAME_R1_001.fastq and SAMPLENAME_R2_001.fastq
+fnFs <- sort(list.files(path, pattern="_R1.fastq", full.names = TRUE))
+fnRs <- sort(list.files(path, pattern="_R2.fastq", full.names = TRUE))
+# Extract sample names, assuming filenames have format: SAMPLENAME_XXX.fastq
+sample.names <- sapply(strsplit(basename(fnFs), "_"), `[`, 1)
+
+```
+
+```{r}
+
+#Inspect read quality profiles
+#We start by visualizing the quality profiles of the forward reads:
+  
+plotQualityProfile(fnFs) #CAMPIONI 1, 104 non venuti bene 
+
+# In gray-scale is a heat map of the frequency of each quality score at each base position. The mean quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines. The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+  
+ # The forward reads are good quality. We generally advise trimming the last few nucleotides to avoid less well-controlled errors that can arise there. These quality profiles do not suggest that any additional trimming is needed. We will truncate the forward reads at position 240 (trimming the last 10 nucleotides).
+  
+ # Now we visualize the quality profile of the reverse reads:
+    
+plotQualityProfile(fnRs) #52, 95, 104 male
+
+```
+
+```{r}
+
+# Filter and trim
+    
+#Assign the filenames for the filtered fastq.gz files.
+    
+# Place filtered files in filtered/ subdirectory
+    
+    filtFs <- file.path(path, "filtered", paste0(sample.names, "_F_filt.fastq.gz"))
+    filtRs <- file.path(path, "filtered", paste0(sample.names, "_R_filt.fastq.gz"))
+    names(filtFs) <- sample.names
+    names(filtRs) <- sample.names
+    
+    length(filtFs)
+    length(filtRs)
+    
+# We'll use standard filtering parameters: maxN=0 (DADA2 requires no Ns), truncQ=2, rm.phix=TRUE and maxEE=2. The maxEE parameter sets the maximum number of "expected errors" allowed in a read, which is a better filter than simply averaging quality scores.
+    
+    any(duplicated(c(fnFs, fnRs)))
+    any(duplicated(c(filtFs, filtRs)))
+    
+    
+    head(filtFs)
+    head(filtRs) #cambia nome quando hai _1_R1 e sostituisci con -1_R1
+    
+    length(fnFs) 
+    length(fnRs)
+    
+    
+    
+    
+    out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, 
+                         truncLen=c(280,250), minLen = c(240,200),
+                         maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+                         compress=TRUE,  multithread=FALSE) # On Windows set multithread=FALSE
+    head(out)  
+#write.csv(out, "out1.csv")
+
+```
+
+```{r}
+
+#Learn the Error Rates
+# The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates. The learnErrors method learns this error model from the data, by alternating estimation of the error rates and inference of sample composition until 
+    # they converge on a jointly consistent solution. As in many machine-learning problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors).  
+    
+errF <- learnErrors(filtFs, multithread=FALSE)
+
+errR<- learnErrors(filtRs, multithread=FALSE)
+
+
+
+
+#It is always worthwhile, as a sanity check if nothing else, to visualize the estimated error rates:
+      
+plotErrors(errF, nominalQ=TRUE)
+plotErrors(errR, nominalQ=TRUE)
+#The error rates for each possible transition (A→C, A→G, …) are shown. Points are the observed error rates for each consensus quality score. The black line shows the estimated error rates after convergence of the machine-learning algorithm. The red line shows the error rates expected under the nominal definition of the Q-score. 
+      
+
+```
+
+```{r}
+
+#Dereplicating: Dereplication combines all identical sequencing reads into into “unique sequences” with a corresponding “abundance”: the number of reads with that unique sequence. Dereplication substantially reduces computation time by eliminating redundant comparisons.
+
+table(file.exists(filtFs)) 
+table(file.exists(filtRs))
+
+exists <- file.exists(filtFs) & file.exists(filtRs)
+filtFs <- filtFs[exists]
+filtRs <- filtRs[exists]
+
+length(filtFs)
+length(filtRs)
+
+derepFs <- derepFastq(filtFs, verbose=TRUE)
+
+derepRs <- derepFastq(filtRs, verbose=TRUE)
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names[exists]
+names(derepRs) <- sample.names[exists]
+
+```
+
+```{r}
+
+#Sample Inference
+
+dadaFs <- dada(derepFs, err=errF, multithread=FALSE)
+dadaRs <- dada(derepRs, err=errR, multithread=FALSE)
+      
+#Inspecting the returned dada-class object:
+        
+dadaFs[[1]]
+
+## dada-class: object describing DADA2 denoising results
+## 744 sequence variants were inferred from 46754 input unique sequences.
+## Key parameters: OMEGA_A = 1e-40, OMEGA_C = 1e-40, BAND_SIZE = 16
+#The DADA2 algorithm inferred 128 true sequence variants from the 1979 unique sequences in the first sample. 
+
+```
+
+```{r}
+
+#Merge paired reads
+#We now merge the forward and reverse reads together to obtain the full denoised sequences. Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences. By default, merged sequences are only output if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region (but these conditions can be changed via function arguments).
+
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[1]])
+
+#The mergers object is a list of data.frames from each sample. Each data.frame contains the merged $sequence, its $abundance, and the indices of the $forward and $reverse sequence variants that were merged. Paired reads that did not exactly overlap were removed by mergePairs, further reducing spurious output.
+
+#Construct sequence table
+#We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% 420:480]
+
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+table(nchar(getSequences(seqtab2))) #cosi rimuovo anche le reads da 312 basi e sono 1299, non sono sicura vada bene
+
+#The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants. This table contains 293 ASVs, and the lengths of our merged sequences all fall within the expected range for this V4 amplicon.
+
+
+```
+
+```{r}
+
+#Remove chimeras
+#The core dada method corrects substitution and indel errors, but chimeras remain. Fortunately, the accuracy of sequence variants after denoising makes identifying chimeric ASVs simpler than when dealing with fuzzy OTUs. Chimeric sequences are identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant “parent” sequences.
+
+#seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=FALSE, verbose=TRUE)
+#dim(seqtab.nochim)
+
+#sum(seqtab.nochim)/sum(seqtab)
+
+#seqtab2
+
+seqtab2.nochim <- removeBimeraDenovo(seqtab2, method="consensus", multithread=FALSE, verbose=TRUE)
+dim(seqtab2.nochim)
+
+sum(seqtab2.nochim)/sum(seqtab2)
+ #The frequency of chimeric sequences varies substantially from dataset to dataset, and depends on on factors including experimental procedures and sample complexity. 
+#Most of your reads should remain after chimera removal
+
+#Track reads through the pipeline
+#As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+  
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab2.nochim))
+
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+head(track)
+
+
+
+```
+
+```{r}
+
+#Assign taxonomy
+##It is common at this point, especially in 16S/18S/ITS amplicon sequencing, to assign taxonomy to the sequence variants. The DADA2 package provides a native implementation of the naive Bayesian classifier method for this purpose. The assignTaxonomy function takes as input a set of sequences to be classified and a training set of reference sequences with known taxonomy, and outputs taxonomic assignments with at least minBoot bootstrap confidence.
+
+# try this way (giova dice sia meglio)
+#if (!requireNamespace("BiocManager", quietly = TRUE))
+#  install.packages("BiocManager")
+#BiocManager::install("DECIPHER")
+
+library(DECIPHER); packageVersion("DECIPHER")
+library(dada2)
+
+memory.limit(size = 140000)
+file.exists("C:/Users/Lisa Cangioli/Desktop/Lady/Crop Microbiome Initiative/wheat/R files/fastq_noadapters1/SILVA_SSU_r138_2019.RData")
+dna <- DNAStringSet(getSequences(seqtab2.nochim)) # Create a DNAStringSet from the ASVs
+load("C:/Users/Lisa Cangioli/Desktop/Lady/Crop Microbiome Initiative/wheat/R files/fastq_noadapters1/SILVA_SSU_r138_2019.RData") # CHANGE TO THE PATH OF YOUR TRAINING SET
+ids <- IdTaxa(dna, trainingSet, strand="both", processors=NULL, verbose=FALSE) # use all processors #strand metti both 
+ranks <- c("domain", "phylum", "class", "order", "family", "genus", "species") # ranks of interest
+# Convert the output object of class "Taxa" to a matrix analogous to the output from assignTaxonomy
+taxid <- t(sapply(ids, function(x) {
+  m <- match(ranks, x$rank)
+  taxa <- x$taxon[m]
+  taxa[startsWith(taxa, "unclassified_")] <- NA
+  taxa
+}))
+colnames(taxid) <- ranks; rownames(taxid) <- getSequences(seqtab2.nochim)
+###### End of DADA2 part.
+```
+
+```{r}
+#phyloseq part
+library(phyloseq)
+library(ggplot2)      
+library(dplyr)        # filter and reformat data frames
+
+# Reading data
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/Analisi Lady/R files")
+meta <- read.csv("SIMBA_metadata.csv", sep = ",")
+row.names(meta) <- meta$sample
+meta = subset(meta, select = -c(sample) )
+counts <- seqtab2.nochim
+taxa <- taxid
+
+  
+# Building phyloseq object
+ps <- phyloseq(otu_table(counts, taxa_are_rows = F),
+                    tax_table(taxa),
+                    sample_data(meta))
+
+dna <- Biostrings::DNAStringSet(taxa_names(ps))
+names(dna) <- taxa_names(ps)
+ps <- merge_phyloseq(ps, dna)
+taxa_names(ps) <- paste0("ASV", seq(ntaxa(ps)))
+ps
+
+```
+
+```{r}
+#remove samples < 5000 reads : 104,105,109,111,112,13,145,31,32,62,95 samples to be removed
+#rimuovo quelli con colonna rm SI
+
+ps1 <- subset_samples(ps, rm=="no")
+
+```
+
+```{r}
+#POMODORO
+ps_pom <- prune_samples(sample_data(ps1)$crop == "pomodoro", ps1)
+
+ps1_pom <- subset_taxa(ps_pom, phylum != "NA")
+
+UNIPR_pomodoro <- ps1_pom
+
+#MAIS
+ps_mais <- prune_samples(sample_data(ps1)$crop == "mais", ps1)
+
+ps1_mais <- subset_taxa(ps_mais, phylum != "NA")
+
+UBO_mais <- subset_samples(ps1_mais, site == "UBO mais" )
+UNIPR_mais <- subset_samples(ps1_mais, site == "UNIPR mais" )
+
+UNIPR_mais_f <- subset_samples(UNIPR_mais, time_of_sampling == "flowering" )
+
+UNIPR_mais_h <- subset_samples(UNIPR_mais, time_of_sampling == "harvesting" )
+
+```
+
+```{r}
+#devo rifare un ps per unipr mais per rinominarei campioni, mi ripreparo i file giusti
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/Analisi Lady/R files/paper uniprmais")
+otu_uniprmais <- read.csv("UNIPRmais_otu.csv")
+sample <- c("CTR T1_1", "CTR T1_2", "CTR T1_3", "CHAR T1_1", "CHAR T1_2", "CHAR T1_3", "AMF T1_1", "AMF T1_2", "AMF T1_3", "CHAR+AMF T1_1", "CHAR+AMF T1_2", "CHAR+AMF T1_3", "CHAR+B+AMF T1_1", "CHAR+B+AMF T1_2", "CHAR+B+AMF T1_3", "CHAR+C+AMF T1_1", "CHAR+C+AMF T1_2", "CHAR+C+AMF T1_3", "CTR T2_1", "CTR T2_2", "CHAR T2_1", "CHAR T2_2", "CHAR T2_3", "AMF T2_1", "AMF T2_2", "AMF T2_3", "CHAR+AMF T2_1", "CHAR+AMF T2_2", "CHAR+AMF T2_3", "CHAR+B+AMF T2_1", "CHAR+B+AMF T2_2", "CHAR+B+AMF T2_3", "CHAR+C+AMF T2_1", "CHAR+C+AMF T2_2", "CHAR+C+AMF T2_3")
+
+otu_uniprmais$sample <- sample
+row.names(otu_uniprmais) <- otu_uniprmais$sample
+otu_uniprmais = subset(otu_uniprmais, select = -c(sample) )
+
+otu_uniprmais = subset(otu_uniprmais, select = -c(X) )
+write.csv(otu_uniprmais, "otu_uniprmais_ok.csv")
+
+tax_uniprmais <- read.csv("UNIPRmais_tax.csv")
+row.names(tax_uniprmais) <- tax_uniprmais$X
+tax_uniprmais = subset(tax_uniprmais, select = -c(X))
+write.csv(tax_uniprmais, "UNIPRmais_tax_ok")
+tax_uniprmais <- as.matrix(tax_uniprmais)
+
+meta_uniprmais <- read.csv("UNIPR_meta2.csv")
+row.names(meta_uniprmais) <- meta_uniprmais$code
+meta_uniprmais = subset(meta_uniprmais, select = -c(code))
+
+
+UNIPR_mais_nomiok <- phyloseq(otu_table(otu_uniprmais, taxa_are_rows = F),
+                    tax_table(tax_uniprmais),
+                    sample_data(meta_uniprmais))
+
+```
+
+#collapse replicates
+library(microbiome)
+merged_ps <- merge_samples(ps, "code")
+ps_col <- merge_samples(sample_data(ps), "code")
+print(ps_col)
+print(merged_ps)
+sample_names(ps)
+sample_names(merged_ps)
+identical(ps_col, sample_data(merged_ps))
+
+
+
+```{r}
+#rarefaction curve #1 ALL SAMPLES
+psdata <- ps
+psdata
+sample_sums(psdata)
+#Calculate alpha diversity
+set.seed(42)
+
+calculate_rarefaction_curves <- function(psdata, measures, depths) {
+  require('plyr') # ldply
+  require('reshape2') # melt
+  
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+    
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+    
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+    
+    # as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+    
+    molten_alpha_diversity
+  }
+  
+  names(depths) <- depths # this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive(), 'text', 'none'))
+  
+  # convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+  
+  rarefaction_curve_data
+}
+
+rarefaction_curve_data <- calculate_rarefaction_curves(psdata, c('Observed', 'Shannon'), rep(c(1, 10, 100, 1000, 1:100 * 10000), each = 10))
+summary(rarefaction_curve_data)
+#Summarize alpha diversity
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+#Add sample data
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary, data.frame(sample_data(psdata)), by.x = 'Sample', by.y = 'row.names')
+#Plot
+library('ggplot2')
+
+ggplot(
+  data = rarefaction_curve_data_summary_verbose,
+  mapping = aes(
+    x = Depth,
+    y = Alpha_diversity_mean,
+    ymin = Alpha_diversity_mean - Alpha_diversity_sd,
+    ymax = Alpha_diversity_mean + Alpha_diversity_sd,
+    group = Sample
+  )
+
+) + geom_line(size=0.1
+  ) + geom_pointrange(cex = 0.05
+    
+  ) + facet_wrap(
+  facets = ~ Measure,
+  scales = 'free_y'
+) + geom_text(aes(x = Depth, y=Alpha_diversity_mean, label=Sample), cex = 4, hjust=-0.05)
+
+
+```
+
+```{r}
+#rarefaction curve #1 UBO MAIS
+psdata <- UBO_mais
+psdata
+sample_sums(psdata)
+#Calculate alpha diversity
+set.seed(42)
+
+calculate_rarefaction_curves <- function(psdata, measures, depths) {
+  require('plyr') # ldply
+  require('reshape2') # melt
+  
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+    
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+    
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+    
+    # as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+    
+    molten_alpha_diversity
+  }
+  
+  names(depths) <- depths # this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive(), 'text', 'none'))
+  
+  # convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+  
+  rarefaction_curve_data
+}
+
+rarefaction_curve_data <- calculate_rarefaction_curves(psdata, c('Observed', 'Shannon'), rep(c(1, 10, 100, 1000, 1:100 * 10000), each = 10))
+summary(rarefaction_curve_data)
+#Summarize alpha diversity
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+#Add sample data
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary, data.frame(sample_data(psdata)), by.x = 'Sample', by.y = 'row.names')
+#Plot
+library('ggplot2')
+
+ggplot(
+  data = rarefaction_curve_data_summary_verbose,
+  mapping = aes(
+    x = Depth,
+    y = Alpha_diversity_mean,
+    ymin = Alpha_diversity_mean - Alpha_diversity_sd,
+    ymax = Alpha_diversity_mean + Alpha_diversity_sd,
+    group = Sample
+  )
+
+) + geom_line(size=0.1
+  ) + geom_pointrange(cex = 0.05
+    
+  ) + facet_wrap(
+  facets = ~ Measure,
+  scales = 'free_y'
+) + geom_text(aes(x = Depth, y=Alpha_diversity_mean, label=Sample), cex = 4, hjust=-0.05)
+```
+
+
+```{r}
+#rarefaction curve #1 UBO MAIS
+psdata <- UNIPR_mais
+psdata
+sample_sums(psdata)
+#Calculate alpha diversity
+set.seed(42)
+
+calculate_rarefaction_curves <- function(psdata, measures, depths) {
+  require('plyr') # ldply
+  require('reshape2') # melt
+  
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+    
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+    
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+    
+    # as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+    
+    molten_alpha_diversity
+  }
+  
+  names(depths) <- depths # this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive(), 'text', 'none'))
+  
+  # convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+  
+  rarefaction_curve_data
+}
+
+rarefaction_curve_data <- calculate_rarefaction_curves(psdata, c('Observed', 'Shannon'), rep(c(1, 10, 100, 1000, 1:100 * 10000), each = 10))
+summary(rarefaction_curve_data)
+#Summarize alpha diversity
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+#Add sample data
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary, data.frame(sample_data(psdata)), by.x = 'Sample', by.y = 'row.names')
+#Plot
+library('ggplot2')
+
+ggplot(
+  data = rarefaction_curve_data_summary_verbose,
+  mapping = aes(
+    x = Depth,
+    y = Alpha_diversity_mean,
+    ymin = Alpha_diversity_mean - Alpha_diversity_sd,
+    ymax = Alpha_diversity_mean + Alpha_diversity_sd,
+    group = Sample
+  )
+
+) + geom_line(size=0.1
+  ) + geom_pointrange(cex = 0.05
+    
+  ) + facet_wrap(
+  facets = ~ Measure,
+  scales = 'free_y'
+) + geom_text(aes(x = Depth, y=Alpha_diversity_mean, label=Sample), cex = 4, hjust=-0.05)
+
+
+```
+
+
+```{r}
+#rarefaction curve #1 UBO MAIS
+psdata <- UNIPR_pomodoro
+psdata
+sample_sums(psdata)
+#Calculate alpha diversity
+set.seed(42)
+
+calculate_rarefaction_curves <- function(psdata, measures, depths) {
+  require('plyr') # ldply
+  require('reshape2') # melt
+  
+  estimate_rarified_richness <- function(psdata, measures, depth) {
+    if(max(sample_sums(psdata)) < depth) return()
+    psdata <- prune_samples(sample_sums(psdata) >= depth, psdata)
+    
+    rarified_psdata <- rarefy_even_depth(psdata, depth, verbose = FALSE)
+    
+    alpha_diversity <- estimate_richness(rarified_psdata, measures = measures)
+    
+    # as.matrix forces the use of melt.array, which includes the Sample names (rownames)
+    molten_alpha_diversity <- melt(as.matrix(alpha_diversity), varnames = c('Sample', 'Measure'), value.name = 'Alpha_diversity')
+    
+    molten_alpha_diversity
+  }
+  
+  names(depths) <- depths # this enables automatic addition of the Depth to the output by ldply
+  rarefaction_curve_data <- ldply(depths, estimate_rarified_richness, psdata = psdata, measures = measures, .id = 'Depth', .progress = ifelse(interactive(), 'text', 'none'))
+  
+  # convert Depth from factor to numeric
+  rarefaction_curve_data$Depth <- as.numeric(levels(rarefaction_curve_data$Depth))[rarefaction_curve_data$Depth]
+  
+  rarefaction_curve_data
+}
+
+rarefaction_curve_data <- calculate_rarefaction_curves(psdata, c('Observed', 'Shannon'), rep(c(1, 10, 100, 1000, 1:100 * 10000), each = 10))
+summary(rarefaction_curve_data)
+#Summarize alpha diversity
+rarefaction_curve_data_summary <- ddply(rarefaction_curve_data, c('Depth', 'Sample', 'Measure'), summarise, Alpha_diversity_mean = mean(Alpha_diversity), Alpha_diversity_sd = sd(Alpha_diversity))
+#Add sample data
+rarefaction_curve_data_summary_verbose <- merge(rarefaction_curve_data_summary, data.frame(sample_data(psdata)), by.x = 'Sample', by.y = 'row.names')
+#Plot
+library('ggplot2')
+
+ggplot(
+  data = rarefaction_curve_data_summary_verbose,
+  mapping = aes(
+    x = Depth,
+    y = Alpha_diversity_mean,
+    ymin = Alpha_diversity_mean - Alpha_diversity_sd,
+    ymax = Alpha_diversity_mean + Alpha_diversity_sd,
+    group = Sample
+  )
+
+) + geom_line(size=0.1
+  ) + geom_pointrange(cex = 0.05
+    
+  ) + facet_wrap(
+  facets = ~ Measure,
+  scales = 'free_y'
+) + geom_text(aes(x = Depth, y=Alpha_diversity_mean, label=Sample), cex = 4, hjust=-0.05)
+
+
+```
+
+
+```{r}
+library(QsRutils)
+
+N <- rowSums(counts)
+
+#Goods coverage
+gcover <- goods(counts)
+#write.csv(gcover, "goods_coverage.csv")
+```
+
+
+```{r}
+library(ranacapa)
+library(ggplot2)
+
+#rarecurve2
+
+rare <- ggrare(unipr, step = 1000, color = "treatment", label = "Sample", se = FALSE) + theme(text = element_text(size = 10))
+rare
+```
+
+```{r}
+gcover_unprmais <- goods(otu_uniprmais)
+#write.csv(gcover_unprmais, "goods_coverage_UNIPRmais.csv")
+
+library(microbiome)
+library(ggpubr)
+library(knitr)
+
+rich_uniprmais_noimiok <- estimate_richness(UNIPR_mais_nomiok)
+#write.csv(rich_uniprmais_noimiok, "alpha_maisok.csv" )
+estimateEvenness(UNIPR_mais_nomiok)
+tab <- evenness(otu_uniprmais, zeroes = T)
+#write.csv(tab, "alpha.csv")
+```
+
+```{r}
+#barplot >0.05 con abbondanza relativa UNIPR mais
+x <- tax_glom(UNIPR_mais_nomiok, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(UNIPR_mais_nomiok)
+theme_set(theme_bw())
+tax_glom(UNIPR_mais_nomiok, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(y = "Relative abundance") + theme(text = element_text(size = 12))
+
+par(mfrow=c(1,5))
+
+UNIPR_maisnomiok_sub.ord <- ordinate(UNIPR_mais_nomiok, "NMDS", "bray")
+plot_ordination(UNIPR_mais_nomiok, UNIPR_maisnomiok_sub.ord, type="samples", color="treatment",  
+                  title="OTUs") + geom_point(size=3)
+```
+
+
+
+
+```{r}
+#barplot >0.05 con abbondanza relativa pomodoro
+x <- tax_glom(UNIPR_pomodoro, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(UNIPR_pomodoro)
+theme_set(theme_bw())
+tax_glom(UNIPR_pomodoro, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(y = "Relative abundance")
+
+par(mfrow=c(1,5))
+
+
+#barplot >0.05 con abbondanza relativa UBO mais
+x <- tax_glom(UBO_mais, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(UBO_mais)
+theme_set(theme_bw())
+tax_glom(UBO_mais, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(y = "Relative abundance") + theme(text = element_text(size = 12))
+
+par(mfrow=c(1,5))
+
+#barplot >0.05 con abbondanza relativa UNIPR mais
+x <- tax_glom(UNIPR_mais, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(UNIPR_mais)
+theme_set(theme_bw())
+tax_glom(UNIPR_mais, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(y = "Relative abundance") + theme(text = element_text(size = 12))
+
+par(mfrow=c(1,5))
+
+```
+
+```{r}
+#barplot >0.05 con abbondanza relativa pomodoro treatment
+x <- tax_glom(UNIPR_pomodoro, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(UNIPR_pomodoro)
+theme_set(theme_bw())
+tax_glom(UNIPR_pomodoro, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = treatment, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(y = "Relative abundance") + theme(text = element_text(size = 30))
+
+par(mfrow=c(1,5))
+
+
+#barplot >0.05 con abbondanza relativa UBO mais treatment
+x <- tax_glom(UBO_mais, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(UBO_mais)
+theme_set(theme_bw())
+tax_glom(UBO_mais, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = treatment, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(y = "Relative abundance") + theme(text = element_text(size = 30))
+
+par(mfrow=c(1,5))
+
+#barplot >0.05 con abbondanza relativa UNIPR mais treatment
+x <- tax_glom(UNIPR_mais, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(UNIPR_mais)
+theme_set(theme_bw())
+tax_glom(UNIPR_mais, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = code, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(y = "Relative abundance") + theme(text = element_text(size = 30))
+
+par(mfrow=c(1,5))
+
+```
+
+
+```{r}
+#Visualize alpha-diversity: UBO mais
+
+plot_richness(UBO_mais, x="treatment", measures=c("Shannon", "Simpson"))
+plot_richness(UBO_mais, x="code", measures=c("Shannon", "Simpson"))
+
+#Bar graphs
+plot_bar(UBO_mais, fill = "phylum")+ geom_bar(aes(color=phylum, fill=phylum), stat="identity", position="stack")
+
+rich_UBO_mais <- estimate_richness(UBO_mais)
+
+#Test whether the observed number of OTUs differs significantly between seasons. We make a non-parametric test, the Wilcoxon rank-sum test (Mann-Whitney):
+
+pairwise.wilcox.test(rich_UBO_mais$Observed, sample_data(UBO_mais)$treatment) #mais treatment
+
+pairwise.wilcox.test(rich_UBO_mais$Observed, sample_data(UBO_mais)$fertilization) #mais fertilization
+
+pairwise.wilcox.test(rich_UBO_mais$Observed, sample_data(UBO_mais)$time_of_sampling) #mais time of sampling
+```
+
+```{r}
+#Visualize alpha-diversity: UNIPR_mais
+
+plot_richness(UNIPR_mais, x="treatment", measures=c("Shannon", "Simpson"))
+plot_richness(UNIPR_mais, x="code", measures=c("Shannon", "Simpson"))
+
+#Bar graphs
+plot_bar(UNIPR_mais, fill = "phylum")+ geom_bar(aes(color=phylum, fill=phylum), stat="identity", position="stack")
+
+rich_UNIPR_mais <- estimate_richness(UNIPR_mais)
+
+#Test whether the observed number of OTUs differs significantly between seasons. We make a non-parametric test, the Wilcoxon rank-sum test (Mann-Whitney):
+
+pairwise.wilcox.test(rich_UNIPR_mais$Observed, sample_data(UNIPR_mais)$treatment) #mais treatment
+
+pairwise.wilcox.test(rich_UNIPR_mais$Observed, sample_data(UNIPR_mais)$time_of_sampling) #mais time of sampling
+
+
+```
+
+```{r}
+#Visualize alpha-diversity: UNIPR_mais
+
+plot_richness(UNIPR_pomodoro, x="treatment", measures=c("Shannon", "Simpson"))
+plot_richness(UNIPR_pomodoro, x="code", measures=c("Shannon", "Simpson"))
+
+#Bar graphs
+plot_bar(UNIPR_pomodoro, fill = "phylum")+ geom_bar(aes(color=phylum, fill=phylum), stat="identity", position="stack")
+
+rich_UNIPR_pomodoro <- estimate_richness(UNIPR_pomodoro)
+
+#Test whether the observed number of OTUs differs significantly between seasons. We make a non-parametric test, the Wilcoxon rank-sum test (Mann-Whitney):
+
+pairwise.wilcox.test(rich_UNIPR_pomodoro$Observed, sample_data(UNIPR_pomodoro)$treatment) #mais treatment
+
+
+```
+
+
+
+
+```{r}
+#Beta diversity
+#Ordination
+#Do multivariate analysis based on Bray-Curtis distance and NMDS ordination.
+
+UNIPR_pom_sub.ord <- ordinate(UNIPR_pomodoro, "NMDS", "bray")
+
+UBO_mais_sub.ord <- ordinate(UBO_mais, "NMDS", "bray")
+
+UNIPR_mais_sub.ord <- ordinate(UNIPR_mais, "NMDS", "bray")
+
+
+#plot OTUs
+plot_ordination(UNIPR_pomodoro, UNIPR_pom_sub.ord, type="samples", color="treatment",  
+                  title="OTUs pom") + geom_point(size=3)
+plot_ordination(UBO_mais, UBO_mais_sub.ord, type="samples", color="treatment", shape= "fertilization", 
+                  title="OTUsmais") +  geom_point(size=3)
+
+                  #facet_wrap(~time_of_sampling) +
+ 
+
+plot_ordination(UNIPR_mais, UNIPR_mais_sub.ord, type="samples", color="treatment",  
+                  title="OTUsmais") + 
+                  facet_wrap(~time_of_sampling) +
+  geom_point(size=3)
+
+
+library(phylosmith)
+nmds_phyloseq(UNIPR_mais, "treatment", method = 'bray', circle = 0.95,
+labels = NULL, colors = 'default', verbose = TRUE) + 
+                  facet_wrap(~time_of_sampling)
+
+#Test whether the x differ significantly from each other using the permutational ANOVA (PERMANOVA) analysis:
+library(vegan)
+
+
+#pom
+metadata <- as(sample_data(UNIPR_pomodoro), "data.frame")
+
+adonis(distance(UNIPR_pomodoro, method="bray") ~ treatment,
+       data = metadata)
+
+#UBO mais
+metadata <- as(sample_data(UBO_mais), "data.frame")
+
+adonis(distance(UBO_mais, method="bray") ~ treatment*fertilization,
+       data = metadata)
+
+adonis(distance(UBO_mais, method="bray") ~ time_of_sampling,
+       data = metadata)
+
+library(pairwiseAdonis)
+dist.uf <- phyloseq::distance(UBO_mais, method = "bray")
+
+pairwise.adonis(dist.uf, sample_data(UBO_mais)$treatment)
+
+
+metadata <- as(sample_data(UBO_mais), "data.frame")
+dist.uf <- phyloseq::distance(UBO_mais, method = "bray")
+pairwise.adonis(dist.uf, sample_data(UBO_mais)$fertilization) #diff tra micosat e control
+ps.disper <- betadisper(dist.uf, metadata$fertilization)
+permutest(ps.disper, pair=TRUE) # no sig diff su ps 
+
+
+#UNIPR mais
+metadata <- as(sample_data(UNIPR_mais), "data.frame")
+
+adonis(distance(UNIPR_mais, method="bray") ~ treatment,
+       data = metadata)
+
+adonis(distance(UNIPR_mais, method="bray") ~ time_of_sampling,
+       data = metadata)
+```
+
+
+```{r}
+library(microbiome)
+library(ggplot2)
+library(dplyr)
+pseq.rel <- microbiome::transform(UBO_mais, "compositional")
+otu <- abundances(pseq.rel)
+meta <- meta(pseq.rel)
+library(vegan)
+permanova <- adonis(t(otu) ~ treatment*fertilization*time_of_sampling,
+               data = meta, permutations=999, method = "bray")
+
+```
+   
+```{r}
+library(pairwiseAdonis)
+#permanova per vedere quali campioni differiscono
+#Permanova su oggetto phyloseq UBO_mais
+metadata <- as(sample_data(UBO_mais), "data.frame")
+dist.uf <- phyloseq::distance(UBO_mais, method = "euclidean")
+
+pairwise.adonis(dist.uf, sample_data(UBO_mais)$fertilization)
+
+pairwise.adonis(dist.uf, sample_data(UBO_mais)$treatment)
+
+pairwise.adonis(dist.uf, sample_data(UBO_mais)$time_of_sampling)
+
+
+#Permanova su oggetto phyloseq UNIPR_mais
+metadata <- as(sample_data(UNIPR_mais), "data.frame")
+dist.uf <- phyloseq::distance(UNIPR_mais, method = "euclidean")
+
+pairwise.adonis(dist.uf, sample_data(UNIPR_mais)$treatment)
+
+pairwise.adonis(dist.uf, sample_data(UNIPR_mais)$time_of_sampling)
+
+
+#Permanova su oggetto phyloseq UNIPR_pomodoro
+metadata <- as(sample_data(UNIPR_pomodoro), "data.frame")
+dist.uf <- phyloseq::distance(UNIPR_pomodoro, method = "euclidean")
+
+pairwise.adonis(dist.uf, sample_data(UNIPR_pomodoro)$treatment)
+```
+
+```{r}
+#DESeq
+library(DESeq2)
+#pomodoro
+dds_pom <- phyloseq_to_deseq2(ps1_pom, design = ~treatment)
+
+dds_pom <-estimateSizeFactors(dds_pom, type = 'poscounts')
+
+dds_pom <- DESeq(dds_pom)
+
+res_pom <- results(dds_pom)
+
+res_pom <- res_pom[order(res_pom$padj),]
+
+head(res_pom)
+
+#mais treatment
+dds_mais_t <- phyloseq_to_deseq2(ps1_mais, design = ~treatment)
+
+dds_mais_t <-estimateSizeFactors(dds_mais_t, type = 'poscounts')
+
+dds_mais_t <- DESeq(dds_mais_t)
+
+res_mais_t <- results(dds_mais_t)
+
+res_mais_t <- res_mais[order(res_mais_t$padj),]
+
+head(res_mais_t)
+
+#mais fertilization
+dds_mais_f <- phyloseq_to_deseq2(ps1_mais, design = ~fertilization)
+
+dds_mais_f <-estimateSizeFactors(dds_mais_f, type = 'poscounts')
+
+dds_mais_f <- DESeq(dds_mais_f)
+
+res_mais_f <- results(dds_mais_f)
+
+res_mais_f <- res_mais_f[order(res_mais_f$padj),]
+
+head(res_mais_f)
+
+```
+
+```{r}
+#PCA deseq2 a una matrice per:
+#pomodoro
+#First we need to transform the raw count data
+#vst function will perform variance stabilizing transformation
+
+vs_pom <- varianceStabilizingTransformation(dds_pom, blind=FALSE)
+plotPCA(vs_pom, intgroup="treatment")
+
+#mais treatment
+vs_mais_t <- varianceStabilizingTransformation(dds_mais_t, blind=FALSE)
+plotPCA(vs_mais_t, intgroup="treatment")
+
+#mais fertilization
+vs_mais_f <- varianceStabilizingTransformation(dds_mais_f, blind=FALSE)
+plotPCA(vs_mais_f, intgroup="fertilization")
+```
+
+```{r}
+#pomodoro
+library(microbiome)
+#Differential abundance testing 
+#This is simply applying PCA to the centered log-ratio (CLR) transformed counts. 
+#CLR transform, The centered log-ratio (clr) transformation uses the geometric mean of the sample vector as the reference, Importantly, transformations are not normalizations: while normalizations claim to recast the data in absolute terms, transformations do not. The results of a transformation-based analysis must be interpreted with respect to the chosen reference. 
+(ps_clr_pom <- microbiome::transform(UNIPR_pomodoro, "clr"))   
+
+phyloseq::otu_table(UNIPR_pomodoro)[1:5, 1:5]
+phyloseq::otu_table(ps_clr_pom)[1:5, 1:5]
+
+#PCA via phyloseq
+ord_clr_pom <- phyloseq::ordinate(ps_clr_pom, "RDA")
+#Plot scree plot
+phyloseq::plot_scree(ord_clr_pom) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+#Examine eigenvalues and % prop. variance explained. eigenvalues=In matematica, in particolare in algebra lineare, un autovettore di una funzione tra spazi vettoriali è un vettore non nullo la cui immagine è il vettore stesso moltiplicato per un numero (reale o complesso) detto autovalore.[1] Se la funzione è lineare, gli autovettori aventi in comune lo stesso autovalore, insieme con il vettore nullo, formano uno spazio vettoriale, detto autospazio.[2] La nozione di autovettore viene generalizzata dal concetto di vettore radicale o autovettore generalizzato.
+head(ord_clr_pom$CA$eig)                                                  
+
+sapply(ord_clr_pom$CA$eig[1:5], function(x) x / sum(ord_clr_pom$CA$eig)) 
+
+#Scale axes and plot ordination
+clr1 <- ord_clr_pom$CA$eig[1] / sum(ord_clr_pom$CA$eig)
+clr2 <- ord_clr_pom$CA$eig[2] / sum(ord_clr_pom$CA$eig)
+phyloseq::plot_ordination(UNIPR_pomodoro, ord_clr_pom, type="samples", color="treatment") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = treatment), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_pom, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr_pom)$treatment)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_pom)$treatment)
+dispr
+
+plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+
+boxplot(dispr, main = "", xlab = "")
+
+permutest(dispr, pairwise = TRUE)
+
+
+
+```
+
+
+```{r}
+#UBO mais treatment
+library(microbiome)
+#Differential abundance testing 
+#This is simply applying PCA to the centered log-ratio (CLR) transformed counts. 
+#CLR transform, The centered log-ratio (clr) transformation uses the geometric mean of the sample vector as the reference, Importantly, transformations are not normalizations: while normalizations claim to recast the data in absolute terms, transformations do not. The results of a transformation-based analysis must be interpreted with respect to the chosen reference. 
+(ps_clr_UBO_mais <- microbiome::transform(UBO_mais, "clr"))   
+
+phyloseq::otu_table(UBO_mais)[1:5, 1:5]
+phyloseq::otu_table(ps_clr_UBO_mais)[1:5, 1:5]
+
+#PCA via phyloseq
+ord_clr_UBO_mais <- phyloseq::ordinate(ps_clr_UBO_mais, "RDA")
+#Plot scree plot
+phyloseq::plot_scree(ord_clr_UBO_mais) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+#Examine eigenvalues and % prop. variance explained. eigenvalues=In matematica, in particolare in algebra lineare, un autovettore di una funzione tra spazi vettoriali è un vettore non nullo la cui immagine è il vettore stesso moltiplicato per un numero (reale o complesso) detto autovalore.[1] Se la funzione è lineare, gli autovettori aventi in comune lo stesso autovalore, insieme con il vettore nullo, formano uno spazio vettoriale, detto autospazio.[2] La nozione di autovettore viene generalizzata dal concetto di vettore radicale o autovettore generalizzato.
+head(ord_clr_UBO_mais$CA$eig)                                                  
+
+sapply(ord_clr_UBO_mais$CA$eig[1:5], function(x) x / sum(ord_clr_UBO_mais$CA$eig)) 
+
+#Scale axes and plot ordination
+clr1 <- ord_clr_UBO_mais$CA$eig[1] / sum(ord_clr_UBO_mais$CA$eig)
+clr2 <- ord_clr_UBO_mais$CA$eig[2] / sum(ord_clr_UBO_mais$CA$eig)
+phyloseq::plot_ordination(UBO_mais, ord_clr_UBO_mais, type="samples", color="treatment") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = treatment), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_UBO_mais, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr_UBO_mais)$treatment)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_UBO_mais)$treatment)
+dispr
+
+plot(dispr, main = "Ordination Centroids\\\\\\\\\\\\\ and Dispersion Labeled: Aitchison Distance", sub = "")
+bhnhhgb
+boxplot(dipoiytrewspr, main = "", xlab = "")
+
+permutest(dispr, pairwise = TRUE)
+
+```
+
+```{r}
+#UBO mais fertilization
+library(microbiome)
+#Differential abundance testing 
+#This is simply applying PCA to the centered log-ratio (CLR) transformed counts. 
+#CLR transform, The centered log-ratio (clr) transformation uses the geometric mean of the sample vector as the reference, Importantly, transformations are not normalizations: while normalizations claim to recast the data in absolute terms, transformations do not. The results of a transformation-based analysis must be interpreted with respect to the chosen reference. 
+(ps_clr_UBO_mais <- microbiome::transform(UBO_mais, "clr"))   
+
+phyloseq::otu_table(UBO_mais)[1:5, 1:5]
+phyloseq::otu_table(ps_clr_UBO_mais)[1:5, 1:5]
+
+#PCA via phyloseq
+ord_clr_UBO_mais <- phyloseq::ordinate(ps_clr_UBO_mais, "RDA")
+#Plot scree plot
+phyloseq::plot_scree(ord_clr_UBO_mais) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+#Examine eigenvalues and % prop. variance explained. eigenvalues=In matematica, in particolare in algebra lineare, un autovettore di una funzione tra spazi vettoriali è un vettore non nullo la cui immagine è il vettore stesso moltiplicato per un numero (reale o complesso) detto autovalore.[1] Se la funzione è lineare, gli autovettori aventi in comune lo stesso autovalore, insieme con il vettore nullo, formano uno spazio vettoriale, detto autospazio.[2] La nozione di autovettore viene generalizzata dal concetto di vettore radicale o autovettore generalizzato.
+head(ord_clr_UBO_mais$CA$eig)                                                  
+
+sapply(ord_clr_UBO_mais$CA$eig[1:5], function(x) x / sum(ord_clr_UBO_mais$CA$eig)) 
+
+#Scale axes and plot ordination
+clr1 <- ord_clr_UBO_mais$CA$eig[1] / sum(ord_clr_UBO_mais$CA$eig)
+clr2 <- ord_clr_UBO_mais$CA$eig[2] / sum(ord_clr_UBO_mais$CA$eig)
+phyloseq::plot_ordination(UBO_mais, ord_clr_UBO_mais, type="samples", color="fertilization") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = fertilization), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_UBO_mais, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr__UBO_mais)$fertilization)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_UBO_mais)$fertilization)
+dispr
+
+plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+
+boxplot(dispr, main = "", xlab = "")
+
+permutest(dispr, pairwise = TRUE)
+```
+
+```{r}
+#UBO mais time of sampling
+library(microbiome)
+#Differential abundance testing 
+#This is simply applying PCA to the centered log-ratio (CLR) transformed counts. 
+#CLR transform, The centered log-ratio (clr) transformation uses the geometric mean of the sample vector as the reference, Importantly, transformations are not normalizations: while normalizations claim to recast the data in absolute terms, transformations do not. The results of a transformation-based analysis must be interpreted with respect to the chosen reference. 
+(ps_clr_UBO_mais <- microbiome::transform(UBO_mais, "clr"))   
+
+phyloseq::otu_table(UBO_mais)[1:5, 1:5]
+phyloseq::otu_table(ps_clr_UBO_mais)[1:5, 1:5]
+
+#PCA via phyloseq
+ord_clr_UBO_mais <- phyloseq::ordinate(ps_clr_UBO_mais, "RDA")
+#Plot scree plot
+phyloseq::plot_scree(ord_clr_UBO_mais) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+#Examine eigenvalues and % prop. variance explained. eigenvalues=In matematica, in particolare in algebra lineare, un autovettore di una funzione tra spazi vettoriali è un vettore non nullo la cui immagine è il vettore stesso moltiplicato per un numero (reale o complesso) detto autovalore.[1] Se la funzione è lineare, gli autovettori aventi in comune lo stesso autovalore, insieme con il vettore nullo, formano uno spazio vettoriale, detto autospazio.[2] La nozione di autovettore viene generalizzata dal concetto di vettore radicale o autovettore generalizzato.
+head(ord_clr_UBO_mais$CA$eig)                                                  
+
+sapply(ord_clr_UBO_mais$CA$eig[1:5], function(x) x / sum(ord_clr_UBO_mais$CA$eig)) 
+
+#Scale axes and plot ordination
+clr1 <- ord_clr_UBO_mais$CA$eig[1] / sum(ord_clr_UBO_mais$CA$eig)
+clr2 <- ord_clr_UBO_mais$CA$eig[2] / sum(ord_clr_UBO_mais$CA$eig)
+phyloseq::plot_ordination(UBO_mais, ord_clr_UBO_mais, type="samples", color="time_of_sampling") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = time_of_sampling), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_UBO_mais, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr__UBO_mais)$time_of_sampling)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_UBO_mais)$time_of_sampling)
+dispr
+
+plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+
+boxplot(dispr, main = "", xlab = "")
+
+permutest(dispr, pairwise = TRUE)
+
+```
+
+```{r}
+#UNIPR mais treatment
+library(microbiome)
+#Differential abundance testing 
+#This is simply applying PCA to the centered log-ratio (CLR) transformed counts. 
+#CLR transform, The centered log-ratio (clr) transformation uses the geometric mean of the sample vector as the reference, Importantly, transformations are not normalizations: while normalizations claim to recast the data in absolute terms, transformations do not. The results of a transformation-based analysis must be interpreted with respect to the chosen reference. 
+(ps_clr_UNIPR_mais <- microbiome::transform(UNIPR_mais, "clr"))   
+
+phyloseq::otu_table(UNIPR_mais)[1:5, 1:5]
+phyloseq::otu_table(ps_clr_UNIPR_mais)[1:5, 1:5]
+
+#PCA via phyloseq
+ord_clr_UNIPR_mais <- phyloseq::ordinate(ps_clr_UNIPR_mais, "RDA")
+#Plot scree plot
+phyloseq::plot_scree(ord_clr_UNIPR_mais) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+#Examine eigenvalues and % prop. variance explained. eigenvalues=In matematica, in particolare in algebra lineare, un autovettore di una funzione tra spazi vettoriali è un vettore non nullo la cui immagine è il vettore stesso moltiplicato per un numero (reale o complesso) detto autovalore.[1] Se la funzione è lineare, gli autovettori aventi in comune lo stesso autovalore, insieme con il vettore nullo, formano uno spazio vettoriale, detto autospazio.[2] La nozione di autovettore viene generalizzata dal concetto di vettore radicale o autovettore generalizzato.
+head(ord_clr_UNIPR_mais$CA$eig)                                                  
+
+sapply(ord_clr_UNIPR_mais$CA$eig[1:5], function(x) x / sum(ord_clr_UNIPR_mais$CA$eig)) 
+
+#Scale axes and plot ordination
+clr1 <- ord_clr_UNIPR_mais$CA$eig[1] / sum(ord_clr_UNIPR_mais$CA$eig)
+clr2 <- ord_clr_UNIPR_mais$CA$eig[2] / sum(ord_clr_UNIPR_mais$CA$eig)
+phyloseq::plot_ordination(UNIPR_mais, ord_clr_UNIPR_mais, type="samples", color="treatment") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = treatment), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_UNIPR_mais, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr_UNIPR_mais)$treatment)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_UNIPR_mais)$treatment)
+dispr
+
+plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+
+boxplot(dispr, main = "", xlab = "")
+
+permutest(dispr, pairwise = TRUE)
+
+```
+
+
+```{r}
+#UNIPR mais time of sampling
+library(microbiome)
+#Differential abundance testing 
+#This is simply applying PCA to the centered log-ratio (CLR) transformed counts. 
+#CLR transform, The centered log-ratio (clr) transformation uses the geometric mean of the sample vector as the reference, Importantly, transformations are not normalizations: while normalizations claim to recast the data in absolute terms, transformations do not. The results of a transformation-based analysis must be interpreted with respect to the chosen reference. 
+(ps_clr_UNIPR_mais <- microbiome::transform(UNIPR_mais, "clr"))   
+
+phyloseq::otu_table(UNIPR_mais)[1:5, 1:5]
+phyloseq::otu_table(ps_clr_UNIPR_mais)[1:5, 1:5]
+
+#PCA via phyloseq
+ord_clr_UNIPR_mais <- phyloseq::ordinate(ps_clr_UNIPR_mais, "RDA")
+#Plot scree plot
+phyloseq::plot_scree(ord_clr_UNIPR_mais) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+#Examine eigenvalues and % prop. variance explained. eigenvalues=In matematica, in particolare in algebra lineare, un autovettore di una funzione tra spazi vettoriali è un vettore non nullo la cui immagine è il vettore stesso moltiplicato per un numero (reale o complesso) detto autovalore.[1] Se la funzione è lineare, gli autovettori aventi in comune lo stesso autovalore, insieme con il vettore nullo, formano uno spazio vettoriale, detto autospazio.[2] La nozione di autovettore viene generalizzata dal concetto di vettore radicale o autovettore generalizzato.
+head(ord_clr_UNIPR_mais$CA$eig)                                                  
+
+sapply(ord_clr_UNIPR_mais$CA$eig[1:5], function(x) x / sum(ord_clr_UNIPR_mais$CA$eig)) 
+
+#Scale axes and plot ordination
+clr1 <- ord_clr_UNIPR_mais$CA$eig[1] / sum(ord_clr_UNIPR_mais$CA$eig)
+clr2 <- ord_clr_UNIPR_mais$CA$eig[2] / sum(ord_clr_UNIPR_mais$CA$eig)
+phyloseq::plot_ordination(UNIPR_mais, ord_clr_UNIPR_mais, type="samples", color="time_of_sampling") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = time_of_sampling), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_UNIPR_mais, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr_UNIPR_mais)$time_of_sampling)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_UNIPR_mais)$time_of_sampling)
+dispr
+
+plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+
+boxplot(dispr, main = "", xlab = "")
+
+
+permutest(dispr, pairwise = TRUE)
+```
+
+
+#separa ubo mais e unipr mais, nell'NMDS altrimenti perdi le differenti interne ai singoli gruppi
+
+```{r}
+#DESeq
+library(DESeq2)
+
+dds_UBO_t <- phyloseq_to_deseq2(UBO_mais, design = ~treatment)
+dds_UBO_t <-estimateSizeFactors(dds_UBO_t, type = 'poscounts')
+dds_UBO_t <- DESeq(dds_UBO_t)
+res_UBO_t <- results(dds_UBO_t)
+res_UBO_t <- res_UBO_t[order(res_UBO_t$padj),]
+head(res_UBO_t)
+
+dds_UBO_f <- phyloseq_to_deseq2(UBO_mais, design = ~fertilization)
+dds_UBO_f <-estimateSizeFactors(dds_UBO_f, type = 'poscounts')
+dds_UBO_f <- DESeq(dds_UBO_f)
+res_UBO_f <- results(dds_UBO_f)
+res_UBO_f <- res_UBO_f[order(res_UBO_f$padj),]
+head(res_UBO_f)
+
+dds_UBO_ts <- phyloseq_to_deseq2(UBO_mais, design = ~time_of_sampling)
+dds_UBO_ts <-estimateSizeFactors(dds_UBO_ts, type = 'poscounts')
+dds_UBO_ts <- DESeq(dds_UBO_ts)
+res_UBO_ts<- results(dds_UBO_ts)
+res_UBO_ts <- res_UBO_ts[order(res_UBO_ts$padj),]
+head(res_UBO_ts)
+
+dds_UNIPR_t <- phyloseq_to_deseq2(UNIPR_mais, design = ~treatment)
+dds_UNIPR_t <-estimateSizeFactors(dds_UNIPR_t, type = 'poscounts')
+dds_UNIPR_t <- DESeq(dds_UNIPR_t)
+res_UNIPR_t <- results(dds_UNIPR_t)
+res_UNIPR_t <- res_UNIPR[order(res_UNIPR_t$padj),]
+head(res_UNIPR_t)
+
+dds_UNIPR_ts <- phyloseq_to_deseq2(UNIPR_mais, design = ~time_of_sampling)
+dds_UNIPR_ts <-estimateSizeFactors(dds_UNIPR_ts, type = 'poscounts')
+dds_UNIPR_ts <- DESeq(dds_UNIPR_ts)
+res_UNIPR_ts <- results(dds_UNIPR_ts)
+res_UNIPR_ts <- res_UNIPR_ts[order(res_UNIPR_ts$padj),]
+head(res_UNIPR_ts)
+
+
+dds_UNIPR_pom <- phyloseq_to_deseq2(UNIPR_pomodoro, design = ~treatment)
+dds_UNIPR_pom <-estimateSizeFactors(dds_UNIPR_pom, type = 'poscounts')
+dds_UNIPR_pom <- DESeq(dds_UNIPR_pom)
+res_UNIPR_pom <- results(dds_UNIPR_pom)
+res_UNIPR_pom <- res_UNIPR_pom[order(res_UNIPR_pom$padj),]
+head(res_UNIPR_pom)
+```
+
+```{r}
+#PCA deseq2 a una matrice per:
+#First we need to transform the raw count data
+#vst function will perform variance stabilizing transformation
+
+vs_UBO_t <- varianceStabilizingTransformation(dds_UBO_t, blind=FALSE)
+plotPCA(vs_UBO_t, intgroup="treatment")
+
+vs_UBO_f <- varianceStabilizingTransformation(dds_UBO_f, blind=FALSE)
+plotPCA(vs_UBO_f, intgroup="fertilization")
+
+vs_UBO_ts <- varianceStabilizingTransformation(dds_UBO_ts, blind=FALSE)
+plotPCA(vs_UBO_ts, intgroup="time_of_sampling")
+
+
+vs_UNIPR_t <- varianceStabilizingTransformation(dds_UNIPR_t, blind=FALSE)
+plotPCA(vs_UNIPR_t, intgroup="treatment")
+
+vs_UNIPR_ts <- varianceStabilizingTransformation(dds_UNIPR_ts, blind=FALSE)
+plotPCA(vs_UNIPR_ts, intgroup="time_of_sampling")
+
+
+vs_UNIPR_pom <- varianceStabilizingTransformation(dds_UNIPR_pom, blind=FALSE)
+plotPCA(vs_UNIPR_pom, intgroup="treatment")
+```
+
+
+#SIMBA SENZA MICOSAT
+```{r}
+UBO_mais__nomicosat <- subset_samples(UBO_mais, treatment!="Micosat")
+```
+
+```{r}
+#barplot >0.05 con abbondanza relativa pomodoro
+x <- tax_glom(UBO_mais__nomicosat, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  otu_table() %>% data.frame()
+x <- colMeans(x)
+plot(cumsum(sort(x)), type = "l")
+abline(a = 0.05, b = 0)
+x <- cumsum(sort(x)) < 0.05
+x <- names(x)[x]
+sample_data(UBO_mais__nomicosat)
+theme_set(theme_bw())
+tax_glom(UBO_mais__nomicosat, "phylum") %>%
+  transform_sample_counts(function(x) x/sum(x)) %>%
+  psmelt() %>%
+  mutate(phylum = ifelse(OTU %in% x, "Other", as.character(phylum))) %>%
+  mutate(phylum = reorder(factor(phylum), Abundance, FUN = function(x) -sum(x))) %>%
+  ggplot(aes(x = Sample, y = Abundance, fill = phylum)) +
+  geom_col(alpha = 0.8) +
+  scale_color_gradientn(colours = rainbow) +
+  facet_grid(scales = "free_x", space = "free")+
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))+
+  labs(y = "Relative abundance")
+
+par(mfrow=c(1,5))
+
+```
+
+```{r}
+#Visualize alpha-diversity: UBO mais nomicosat
+
+plot_richness(UBO_mais__nomicosat, x="treatment", measures=c("Shannon", "Simpson"))
+plot_richness(UBO_mais__nomicosat, x="code", measures=c("Shannon", "Simpson"))
+
+#Bar graphs
+plot_bar(UBO_mais__nomicosat, fill = "phylum")+ geom_bar(aes(color=phylum, fill=phylum), stat="identity", position="stack")
+
+rich_UBO_mais_nomicosat <- estimate_richness(UBO_mais__nomicosat)
+
+#Test whether the observed number of OTUs differs significantly between seasons. We make a non-parametric test, the Wilcoxon rank-sum test (Mann-Whitney):
+
+pairwise.wilcox.test(rich_UBO_mais_nomicosat$Observed, sample_data(UBO_mais__nomicosat)$treatment) #mais treatment
+
+pairwise.wilcox.test(rich_UBO_mais_nomicosat$Observed, sample_data(UBO_mais__nomicosat)$fertilization) #mais fertilization
+
+pairwise.wilcox.test(rich_UBO_mais_nomicosat$Observed, sample_data(UBO_mais__nomicosat)$time_of_sampling) #mais time of sampling
+```
+
+```{r}
+#Beta diversity
+#Ordination
+#Do multivariate analysis based on Bray-Curtis distance and NMDS ordination.
+
+UBO_mais__nomicosat_sub.ord <- ordinate(UBO_mais__nomicosat, "NMDS", "bray")
+
+
+
+#plot OTUs
+plot_ordination(UBO_mais__nomicosat, UBO_mais__nomicosat_sub.ord, type="samples", color="treatment"
+                  ) + geom_point(size=3)
+plot_ordination(UBO_mais__nomicosat, UBO_mais__nomicosat_sub.ord, type="samples", color="treatment", shape= "fertilization"
+                  ) + 
+                  facet_wrap(~time_of_sampling) +
+  geom_point(size=3)
+
+
+
+
+library(phylosmith)
+nmds_phyloseq(UBO_mais__nomicosat, "treatment", method = 'bray', circle = 0.95,
+labels = NULL, colors = 'default', verbose = TRUE) + 
+                  facet_wrap(~time_of_sampling)
+
+#Test whether the x differ significantly from each other using the permutational ANOVA (PERMANOVA) analysis:
+library(vegan)
+
+#pom
+metadata <- as(sample_data(UBO_mais__nomicosat), "data.frame")
+
+adonis(distance(UBO_mais__nomicosat, method="bray") ~ treatment,
+       data = metadata)
+
+adonis(distance(UBO_mais__nomicosat, method="bray") ~ fertilization,
+       data = metadata)
+
+adonis(distance(UBO_mais__nomicosat, method="bray") ~ treatment*fertilization,
+       data = metadata)
+
+adonis(distance(UBO_mais__nomicosat, method="bray") ~ time_of_sampling,
+       data = metadata)
+
+
+```
+
+```{r}
+library(pairwiseAdonis)
+#permanova per vedere quali campioni differiscono
+#Permanova su oggetto phyloseq UBO_mais__nomicosat
+metadata <- as(sample_data(UBO_mais__nomicosat), "data.frame")
+dist.uf <- phyloseq::distance(UBO_mais__nomicosat, method = "euclidean")
+
+pairwise.adonis(dist.uf, sample_data(UBO_mais__nomicosat)$fertilization)
+
+pairwise.adonis(dist.uf, sample_data(UBO_mais__nomicosat)$treatment)
+
+pairwise.adonis(dist.uf, sample_data(UBO_mais__nomicosat)$time_of_sampling)
+
+
+```
+
+```{r}
+#DESeq
+library(DESeq2)
+
+dds_UBO_nomicosat_t <- phyloseq_to_deseq2(UBO_mais__nomicosat, design = ~treatment)
+dds_UBO_nomicosat_t <-estimateSizeFactors(dds_UBO_nomicosat_t, type = 'poscounts')
+dds_UBO_nomicosat_t <- DESeq(dds_UBO_nomicosat_t)
+res_UBO_nomicosat_t <- results(dds_UBO_nomicosat_t)
+res_UBO_nomicosat_t <- res_UBO_nomicosat_t[order(res_UBO_nomicosat_t$padj),]
+head(res_UBO_nomicosat_t)
+
+dds_UBO_nomicosat_f <- phyloseq_to_deseq2(UBO_mais__nomicosat, design = ~fertilization)
+dds_UBO_nomicosat_f <-estimateSizeFactors(dds_UBO_nomicosat_f, type = 'poscounts')
+dds_UBO_nomicosat_f <- DESeq(dds_UBO_nomicosat_f)
+res_UBO_nomicosat_f <- results(dds_UBO_nomicosat_f)
+res_UBO_nomicosat_f <- res_UBO_nomicosat_f[order(res_UBO_nomicosat_f$padj),]
+head(res_UBO_nomicosat_f)
+
+dds_UBO_nomicosat_ts <- phyloseq_to_deseq2(UBO_mais__nomicosat, design = ~time_of_sampling)
+dds_UBO_nomicosat_ts <-estimateSizeFactors(dds_UBO_nomicosat_ts, type = 'poscounts')
+dds_UBO_nomicosat_ts <- DESeq(dds_UBO_nomicosat_ts)
+res_UBO_nomicosat_ts<- results(dds_UBO_nomicosat_ts)
+res_UBO_nomicosat_ts <- res_UBO_nomicosat_ts[order(res_UBO_nomicosat_ts$padj),]
+head(res_UBO_nomicosat_ts)
+```
+
+```{r}
+#PCA deseq2 a una matrice per:
+#First we need to transform the raw count data
+#vst function will perform variance stabilizing transformation
+
+vs_UBO_nomicosat_t <- varianceStabilizingTransformation(dds_UBO_nomicosat_t, blind=FALSE)
+plotPCA(vs_UBO_nomicosat_t, intgroup="treatment")
+
+vs_UBO_nomicosat_f <- varianceStabilizingTransformation(dds_UBO_nomicosat_f, blind=FALSE)
+plotPCA(vs_UBO_nomicosat_f, intgroup="fertilization")
+
+vs_UBO_nomicosat_ts <- varianceStabilizingTransformation(dds_UBO_nomicosat_ts, blind=FALSE)
+plotPCA(vs_UBO_nomicosat_ts, intgroup="time_of_sampling")
+
+```
+
+```{r}
+#UBO mais treatment no micosat
+library(microbiome)
+#Differential abundance testing 
+#This is simply applying PCA to the centered log-ratio (CLR) transformed counts. 
+#CLR transform, The centered log-ratio (clr) transformation uses the geometric mean of the sample vector as the reference, Importantly, transformations are not normalizations: while normalizations claim to recast the data in absolute terms, transformations do not. The results of a transformation-based analysis must be interpreted with respect to the chosen reference. 
+(ps_clr_UBO_mais_nomicosat <- microbiome::transform(UBO_mais__nomicosat, "clr"))   
+
+phyloseq::otu_table(UBO_mais__nomicosat)[1:5, 1:5]
+phyloseq::otu_table(ps_clr_UBO_mais_nomicosat)[1:5, 1:5]
+
+#PCA via phyloseq
+ord_clr_UBO_mais_nomicosat <- phyloseq::ordinate(ps_clr_UBO_mais_nomicosat, "RDA")
+#Plot scree plot
+phyloseq::plot_scree(ord_clr_UBO_mais_nomicosat) + 
+  geom_bar(stat="identity", fill = "blue") +
+  labs(x = "\nAxis", y = "Proportion of Variance\n")
+
+#Examine eigenvalues and % prop. variance explained. eigenvalues=In matematica, in particolare in algebra lineare, un autovettore di una funzione tra spazi vettoriali è un vettore non nullo la cui immagine è il vettore stesso moltiplicato per un numero (reale o complesso) detto autovalore.[1] Se la funzione è lineare, gli autovettori aventi in comune lo stesso autovalore, insieme con il vettore nullo, formano uno spazio vettoriale, detto autospazio.[2] La nozione di autovettore viene generalizzata dal concetto di vettore radicale o autovettore generalizzato.
+head(ord_clr_UBO_mais_nomicosat$CA$eig)                                                  
+
+sapply(ord_clr_UBO_mais_nomicosat$CA$eig[1:5], function(x) x / sum(ord_clr_UBO_mais_nomicosat$CA$eig)) 
+
+#Scale axes and plot ordination
+clr1 <- ord_clr_UBO_mais_nomicosat$CA$eig[1] / sum(ord_clr_UBO_mais_nomicosat$CA$eig)
+clr2 <- ord_clr_UBO_mais_nomicosat$CA$eig[2] / sum(ord_clr_UBO_mais_nomicosat$CA$eig)
+phyloseq::plot_ordination(UBO_mais__nomicosat, ord_clr_UBO_mais_nomicosat, type="samples", color="treatment") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = treatment), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_UBO_mais_nomicosat, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr_UBO_mais_nomicosat)$treatment)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_UBO_mais_nomicosat)$treatment)
+
+dispr
+
+plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+
+boxplot(dispr, main = "", xlab = "")
+
+permutest(dispr, pairwise = TRUE)
+
+```
+
+```{r}
+#UBO mais no micosat fertilization
+
+phyloseq::plot_ordination(UBO_mais__nomicosat, ord_clr_UBO_mais_nomicosat, type="samples", color="fertilization") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = fertilization), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_UBO_mais_nomicosat, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr_UBO_mais_nomicosat)$fertilization)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_UBO_mais_nomicosat)$fertilization)
+dispr
+
+plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+
+boxplot(dispr, main = "", xlab = "")
+
+permutest(dispr, pairwise = TRUE)
+```
+
+
+```{r}
+#UBO mais time of sampling
+
+phyloseq::plot_ordination(UBO_mais__nomicosat, ord_clr_UBO_mais_nomicosat, type="samples", color="time_of_sampling") + 
+  geom_point(size = 2) +
+  coord_fixed(clr2 / clr1) +
+  stat_ellipse(aes(group = time_of_sampling), linetype = 2)
+
+#PERMANOVA
+#Generate distance matrix
+clr_dist_matrix <- phyloseq::distance(ps_clr_UBO_mais_nomicosat, method = "euclidean") 
+#ADONIS test
+vegan::adonis(clr_dist_matrix ~ phyloseq::sample_data(ps_clr_UBO_mais_nomicosat)$time_of_sampling)
+
+#Dispersion test and plot
+dispr <- vegan::betadisper(clr_dist_matrix, phyloseq::sample_data(ps_clr_UBO_mais_nomicosat)$time_of_sampling)
+dispr
+
+plot(dispr, main = "Ordination Centroids and Dispersion Labeled: Aitchison Distance", sub = "")
+
+boxplot(dispr, main = "", xlab = "")
+
+permutest(dispr, pairwise = TRUE)
+
+```
+
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/Analisi Lady")
+meta_UBO <- read.csv("UBO_meta.csv", sep=",")
+row.names(meta_UBO) <- meta_UBO$X
+meta_UBO = subset(meta_UBO, select = -c(X) )
+#Generate distances for UBO mais
+ord_eu <- ordinate(UBO_mais, method = "PCoA", distance = "bray") 
+  
+#Plot ordinations
+a <- plot_ordination(UBO_mais, ord_eu, color = "treatment",shape= "time_of_sampling") +  facet_wrap(~fertilization) +  theme(text = element_text(size = 30))  +geom_point(size=4)
+#+geom_text(
+    label=rownames(meta_UBO),
+    check_overlap = F
+  )
+ 
+
+meta_UNIPR <- read.csv("UNIPR_meta.csv", sep=",")
+row.names(meta_UNIPR) <- meta_UNIPR$X
+meta_UNIPR = subset(meta_UNIPR, select = -c(X) )
+#Generate distances for UNIPR mais
+ord_eu <- ordinate(UNIPR_mais, method = "PCoA", distance = "bray") 
+  
+#Plot ordinations
+b <- plot_ordination(UNIPR_mais, ord_eu, color = "treatment",shape= "time_of_sampling") + geom_point(size = 4) +  theme(text = element_text(size = 30)) 
+#+geom_text(
+    label=rownames(meta_UNIPR),
+    check_overlap = F)
+
+
+#picrust UBO maize
+```{r}
+library(biomformat);packeageVersion("biomformat")
+
+otu <- t(as(otu_table(UBO_mais), "matrix"))
+otu_biom <- make_biom(data=otu)
+write_biom(otu_biom, "UBO_mais_study_seqs.biom")
+```
+
+```{r}
+library(Biobase)
+otu <- t(as(otu_table(UBO_mais), "matrix"))
+write.table(otu, file = "UBO_mais_study_seqs.tsv", sep="\t", quote = FALSE)
+
+```
+
+
+
+```{r}
+#per fare questo rifai oggetto ps senza rinominare sequenze con ASV
+library(dada2)
+uniquesToFasta(UBO_mais@otu_table, fout="UBO_mais_study_seqs.fna", ids=paste0(taxa_names(UBO_mais)))
+```
+
+#picrust UNIPR maize
+```{r}
+library(biomformat);packeageVersion("biomformat")
+
+otu <- t(as(otu_table(UNIPR_mais), "matrix"))
+otu_biom <- make_biom(data=otu)
+write_biom(otu_biom, "UNIPR_mais_study_seqs.biom")
+```
+
+```{r}
+library(Biobase)
+otu <- t(as(otu_table(UNIPR_mais), "matrix"))
+write.table(otu, file = "UNIPR_mais_study_seqs.tsv", sep="\t", quote = FALSE)
+
+```
+
+
+
+```{r}
+#per fare questo rifai oggetto ps senza rinominare sequenze con ASV
+library(dada2)
+uniquesToFasta(UNIPR_mais@otu_table, fout="UNIPR_mais_study_seqs.fna", ids=paste0(taxa_names(UNIPR_mais)))
+```
+
+```{r}
+library(ggnetwork)
+library(igraph)
+library(propr)
+
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/Analisi Lady/network analysis")
+# Importo le conte
+x <- read.csv("counts_all.csv")
+x <- counts
+# Conta degli zero per ogni ASV
+zeroes <- apply(x, 1, function(x) sum(x == 0))
+# Tengo solo le ASV presenti in almeno 30 campioni
+extr <- zeroes <= 30
+
+# Propr con metrica "rho" (va trasposta la matrice per
+# avere il clustering delle ASV)
+prop <- propr(t(x[extr,]), metric = "rho",
+              ivar = "clr", p = 1000, 
+              symmetrize = T)
+#ncores = 2, va levato
+# Calcolo del false discovery rate (FDR) a diversi
+# cutoff di correlazione (rho)
+prop <- updateCutoffs(prop, cutoff = seq(0, 1, .05), 
+                      ncores = 2)
+
+# FDR < 0.001: usando questo cutoff solo lo 0.1%
+# dei link che trovo potrebbe essere dovuto al caso
+best.cutoff <- min(which(prop@fdr$FDR < 0.001))
+best.cutoff <- prop@fdr$cutoff[best.cutoff]
+
+# Matrice di adiacenza dato il cutoff scelto
+adj <- getAdjacency(prop, cutoff = best.cutoff)
+
+# Generazione dei network. Il "seed" serve per
+# avere un layout riproducibile
+set.seed(123)
+g <- graph_from_adjacency_matrix(adj, mode = "undirected")
+g$layout <- layout_with_fr
+
+plot(g, vertex.size=3, vertex.label = NA)
+
+n <- fortify(g)
+ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(size = .1) +
+  geom_nodes() +
+  theme_blank()
+
+# Se volessi aggiungere informazioni tassonomiche 
+# devi fare unire "n" ad un data frame con le
+# classificazioni.
+
+# Creo delle classificazioni tassonomiche a caso
+#example <- data.frame(ASV=names(extr)[extr],
+#                     phylum = sample(c("Proteobacteria", "Firmicutes", "Bacteroidetes"), 
+#                                    sum(extr), replace = T))
+example2 <- read.csv("taxa_table.csv")
+fix(example2) #la colonna X deve chiamarsi name
+# Mergio i due data frame
+n <- merge(n, example2, by.x = "name", by.y = "name")
+# Plotto
+ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(size = .2) +
+  geom_nodes(aes(fill = family),size = 2,  shape = 21, color = "black") +
+  theme_blank()
+
+# Metriche del network con igraph
+# sull'oggetto "g"
+degree(g)
+closeness(g)
+
+# Clusters
+clust <- cluster_edge_betweenness(g, directed = F)
+clust <- data.frame(clust = as.factor(clust$membership),
+                    name = clust$names)
+n <- merge(n, clust, by = "name")
+ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(size = .2) +
+  geom_nodes(aes(fill = clust), size = 2, shape = 21, color = "black") +
+  theme_blank()
+
+```
+
+
+
+
+```{r}
+library(ggnetwork)
+library(igraph)
+library(propr)
+
+
+# Importo le conte
+x <- read.csv("counts_UBOmais.csv")
+# Conta degli zero per ogni ASV
+zeroes <- apply(x, 1, function(x) sum(x == 0))
+# Tengo solo le ASV presenti in almeno 30 campioni
+extr <- zeroes <= 30
+
+# Propr con metrica "rho" (va trasposta la matrice per
+# avere il clustering delle ASV)
+prop <- propr(t(x[extr,]), metric = "rho",
+              ivar = "clr", p = 1000, 
+              symmetrize = T)
+#ncores = 2, va levato
+# Calcolo del false discovery rate (FDR) a diversi
+# cutoff di correlazione (rho)
+prop <- updateCutoffs(prop, cutoff = seq(0, 1, .05), 
+                      ncores = 2)
+
+# FDR < 0.001: usando questo cutoff solo lo 0.1%
+# dei link che trovo potrebbe essere dovuto al caso
+best.cutoff <- min(which(prop@fdr$FDR < 0.001))
+best.cutoff <- prop@fdr$cutoff[best.cutoff]
+
+# Matrice di adiacenza dato il cutoff scelto
+adj <- getAdjacency(prop, cutoff = best.cutoff)
+
+# Generazione dei network. Il "seed" serve per
+# avere un layout riproducibile
+set.seed(123)
+g <- graph_from_adjacency_matrix(adj, mode = "undirected")
+g$layout <- layout_with_fr
+
+plot(g, vertex.size=3, vertex.label = NA)
+
+n <- fortify(g)
+ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(size = .1) +
+  geom_nodes() +
+  theme_blank()
+
+# Se volessi aggiungere informazioni tassonomiche 
+# devi fare unire "n" ad un data frame con le
+# classificazioni.
+
+# Creo delle classificazioni tassonomiche a caso
+#example <- data.frame(ASV=names(extr)[extr],
+#                     phylum = sample(c("Proteobacteria", "Firmicutes", "Bacteroidetes"), 
+#  sum(extr), replace = T))
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/Analisi Lady/network analysis")
+example2 <- read.csv("taxa_table.csv")
+fix(example2) #la colonna X deve chiamarsi name
+# Mergio i due data frame
+n <- merge(n, example2, by.x = "name", by.y = "name")
+# Plotto
+ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(size = .2) +
+  geom_nodes(aes(fill = phylum),size = 2,  shape = 21, color = "black") +
+  theme_blank()
+
+# Metriche del network con igraph
+# sull'oggetto "g"
+degree(g)
+closeness(g)
+
+# Clusters
+clust <- cluster_edge_betweenness(g, directed = F)
+clust <- data.frame(clust = as.factor(clust$membership),
+                    name = clust$names)
+n <- merge(n, clust, by = "name")
+ggplot(n, aes(x = x, y = y, xend = xend, yend = yend)) +
+  geom_edges(size = .2) +
+  geom_nodes(aes(fill = clust), size = 2, shape = 21, color = "black") +
+  theme_blank()
+
+
+```
+
+
+setwd("C:/Users/Lisa Cangioli/Desktop/Lady/SIMBA files/SIMBA microbiome/Analisi Lady/R files")
+```{r}
+otu <- read.csv("UBOmais_otu.csv")
+row.names(otu) <- otu$X
+otu = subset(otu, select = -c(X))
+
+taxaUBO <- read.csv ("UBOmais_tax.csv")
+row.names(taxaUBO) <- taxaUBO$X
+taxaUBO = subset(taxaUBO, select = -c(X))
+taxaUBO = as.matrix(taxaUBO)
+
+metaUBO <- read.csv("UBO_meta.csv")
+row.names(metaUBO) <- metaUBO$X
+metaUBO = subset(metaUBO, select = -c(X))
+
+UBO_mais_ok <- phyloseq(otu_table(otu, taxa_are_rows = F),
+                    tax_table(taxaUBO),
+                    sample_data(metaUBO))
+
+sample_names(UBO_mais_ok) <- sample_data(UBO_mais_ok)$nome
+```
+
